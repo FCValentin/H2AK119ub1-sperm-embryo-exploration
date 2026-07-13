@@ -1,33 +1,71 @@
-# Sperm derived H2AK119ub1 is required for embryonic development in Xenopus Laevis
+# Sperm-derived H2AK119ub1 is required for embryonic development in *Xenopus laevis*
 
-__Valentin Francois--Campion, Florian Berger, Mami Oikawa, Maissa Goumeidane, Romain Guibeaux, and Jérôme Jullien__
+**Valentin FRANCOIS--CAMPION, Florian Berger, Mami Oikawa, Maissa Goumeidane, Romain Guibeaux & Jérôme Jullien**
 
-H3K4me3, H3K27me3 and H2AK119ub1 have been analyzed during this protocol with ChIP-Sequencing. Transcriptome of Xenopus laevis embryo development was analysed by RNA-Sequencing
+📄 **Published in *Nature Communications*, April 2025**
+[![DOI](https://img.shields.io/badge/DOI-10.1038%2Fs41467--025--58615--7-blue)](https://doi.org/10.1038/s41467-025-58615-7)
 
-## Getting Started
+---
 
-This repository reports all scripts used for bio-informatics analysis. Data are deposited on ENA (PRJEB56442). 
+## About this repository
 
-### Prerequisites and genome version
-Genome version and annotation :
-* Xenopus laevis 9.2 from [Xenbase](https://download.xenbase.org/xenbase/Genomics/JGI/Xenla9.2/)
-* 601DNA sequence (100% ubiquitylated semi-synthetic nucleosome) : tagctcaattggtcgtagcaagctctagcaccgcttaaacgcacgtacgcgctgtcccccgcgttttaaccgccaaggggattactccctagtctccagg
-* CpG islands (cpgIslandExt.txt.gz) and repeats elements (rmsk.txt.gz) annotation file from [UCSC database](https://hgdownload.soe.ucsc.edu/goldenPath/xenLae2/database/)
+This repository contains all bioinformatics scripts used for the data analysis published in François-Campion et al., *Nature Communications*, 2025.
 
-### Tools used for analysis (conda environment)
+Raw data are deposited on ENA under accession number **PRJEB56442**.
 
-* ChIP-Seq conda environment => [Chip.yml](https://github.com/FCValentin/H2AubPaper/blob/main/Chip.yml)
-* RNA-Seq conda environment => [rnaseq_align.yml](https://github.com/FCValentin/H2AubPaper/blob/main/rnaseq_align.yml)
-* R libraries used are shown in [ProcessingChIPdata.R](https://github.com/FCValentin/H2AubPaper/blob/main/ProcessingChIPdata.R)
+### Scientific context
 
-### Scripts used for analysis
+This study investigates the role of the paternal epigenetic mark H2AK119ub1 (a Polycomb Repressive Complex 1 histone modification) in sperm and its transmission to the embryo during fertilisation. We demonstrate that sperm-derived H2AK119ub1 is required for proper early embryonic development in *Xenopus laevis*, establishing a link between paternal epigenetic information and developmental programming.
 
-* RNA-Seq alignment [snakemake](https://gitlab.univ-nantes.fr/E114424Z/rnaseq_align)
-* RNA-Seq R scripts for [gene expression analysis](https://gitlab.univ-nantes.fr/E114424Z/BulkRNAseq)
-* All R scripts for permutations, TF motif heatmap, P-Value of particles enrichment and genomic caracterisation => [ProcessingChIPdata.R](https://github.com/FCValentin/H2AubPaper/blob/main/ProcessingChIPdata.R) 
-* All ChIP-Seq command line for data processing => [ChIP_Sequencing.sh](https://github.com/FCValentin/H2AubPaper/blob/main/ChIP_Sequencing.sh)
-* Scripts for H2A (particles) enrichment detection => [H2A_enrichment.sh](https://github.com/FCValentin/H2AubPaper/blob/main/H2A_enrichment.sh)
+**Key analyses:**
+- ChIP-seq profiling of H2AK119ub1, H3K4me3, H3K27me3 in sperm and embryos at multiple developmental stages
+- Drosophila spike-in normalisation strategy with hybrid *Xenopus laevis* / *Drosophila melanogaster* genome alignment
+- Bulk RNA-seq transcriptomic analysis across four species (*Xenopus laevis*, mouse, rabbit, human)
+- Genomic characterisation, TF motif analysis, permutation tests
 
-## Authors
+---
 
-**Valentin FRANCOIS--CAMPION** 
+## Repository structure
+
+| File | Description |
+|------|-------------|
+| `ChIP_Sequencing.sh` | Full ChIP-seq processing pipeline (alignment, filtering, peak calling) |
+| `H2A_enrichment.sh` | H2AK119ub1 particle enrichment detection |
+| `ProcessingChIPdata.R` | R scripts: permutations, TF motif heatmaps, genomic characterisation |
+| `Chip.yml` | Conda environment for ChIP-seq analysis |
+| `rnaseq_align.yml` | Conda environment for RNA-seq alignment |
+
+**External scripts (GitLab Nantes Université):**
+- RNA-seq alignment (Snakemake): https://gitlab.univ-nantes.fr/E114424Z/rnaseq_align
+- RNA-seq differential expression (R): https://gitlab.univ-nantes.fr/E114424Z/BulkRNAseq
+
+---
+
+## Prerequisites
+
+**Genome references:**
+- *Xenopus laevis* v9.2 — [Xenbase](https://download.xenbase.org/xenbase/Genomics/JGI/Xenla9.2/)
+- 601DNA spike-in sequence (100% ubiquitylated semi-synthetic nucleosome)
+- CpG islands & repeat elements annotation — [UCSC](https://hgdownload.soe.ucsc.edu/goldenPath/xenLae2/database/)
+
+**Tools:** see `Chip.yml` and `rnaseq_align.yml` for conda environments
+
+---
+
+## Citation
+
+```bibtex
+@article{francoiscampion2025,
+  title={Sperm-derived H2AK119ub1 is required for embryonic development in Xenopus laevis},
+  author={François-Campion, Valentin and Berger, Florian and Oikawa, Mami and Goumeidane, Maissa and Guibeaux, Romain and Jullien, Jérôme},
+  journal={Nature Communications},
+  year={2025},
+  doi={10.1038/s41467-025-58615-7}
+}
+```
+
+---
+
+## Author
+
+**Valentin FRANCOIS--CAMPION** — [GitHub](https://github.com/FCValentin) · [ResearchGate](https://www.researchgate.net/profile/Valentin-Francois-Campion)
