@@ -69,9 +69,9 @@ awk '
     print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"p1"\t"p2}
 ' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities >  Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete
 
-##################################
-##### R Script HMM Model #########
-##################################
+###############################################################
+##### R Script HMM Model : check ProcessingChIPdata.R #########
+###############################################################
 
 #Merged bins that overlap between them into a unique one, at different discrete p-value level 
 awk '{if($11>0) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Aenriched_0.1.bed
