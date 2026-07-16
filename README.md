@@ -34,6 +34,7 @@ This study investigates the role of the paternal epigenetic mark H2AK119ub1 (a P
 | `ProcessingChIPdata.R` | R scripts: permutations, TF motif heatmaps, genomic characterisation |
 | `Chip.yml` | Conda environment for ChIP-seq analysis |
 | `rnaseq_align.yml` | Conda environment for RNA-seq alignment |
+| `MaskMerging.py` | Python script for N-mask hybrid genome merging |
 
 **External scripts (GitLab Nantes Université):**
 - RNA-seq alignment (Snakemake): https://gitlab.univ-nantes.fr/E114424Z/rnaseq_align
