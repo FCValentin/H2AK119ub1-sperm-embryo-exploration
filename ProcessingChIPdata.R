@@ -1,234 +1,407 @@
-##--------------------##
-##### LOADING DATA #####
-##--------------------##
+# =============================================================================
+# ProcessingChIPdata.R
+# -----------------------------------------------------------------------------
+# Downstream ChIP-seq statistical analyses for H2AK119ub1 characterisation.
+# Standalone script — NOT called by the shell pipeline, run independently.
+#
+# Sections:
+#   1. Permutation tests — USP21-sensitive gene overlap with H2AK119ub1 peaks
+#   2. Randomisation tests — CpG islands, repeats, genomic features
+#   3. TF motif dot heatmap (HOMER findMotifs.pl output)
+#   4. Peak annotation with ChIPseeker
+#   5. TSS profile p-value (Wilcoxon) from deepTools plotProfile output
+#   6. Proportion tests — H2A vs non-H2A / Nucl vs sub-nucl per genomic bin
+#   7. Hidden Markov Model (HMM) state assignment on fragment probabilities
+#
+# Language : R
+#
+# Author   : Valentin FRANCOIS--CAMPION, PhD
+# Contact  : valentin.francoiscampion@gmail.com
+# GitHub   : https://github.com/FCValentin/H2AK119ub1-sperm-embryo-exploration
+# Paper    : François-Campion V. et al., Nature Communications, 2025
+#            DOI: 10.1038/s41467-025-58615-7
+# =============================================================================
 
-#Importing home made functions
-source("https://gitlab.univ-nantes.fr/E114424Z/veneR/raw/master/loadFun.R?inline=false")
-library(GenomicFeatures)
-library(GenomicRanges)
-library(ChIPseeker)
-library(genomation)
-library(Repitools)
-library(regioneR)
-setwd("C:/Users/ValentinFC/Desktop/Article/IGV")
 
-##----------------------##
-#### DATA IMPORTATION ####
-##----------------------##
+# =============================================================================
+# DEPENDENCIES
+# =============================================================================
 
-### Import all TSS, Enhancer and GeneBody coordinates ###
-UniverseTSS<-toGRanges("Genes9_2TSS5Kb_chrosomose.bed")
-UniverseGenes<-toGRanges("Genes9_2_chrosomose.bed")
-UniverseEnhancers<-toGRanges("Genes9_2Enhancers_chrosomose.bed")
-
-### Import TSS, Enhancer and GeneBody coordinates linked to USP21 sensitive genes ###
-BackgroundTSS<-toGRanges("USP21TSS_chr.bed") 
-BackgroundGenes<-toGRanges("USP21Genes.bed")
-BackgroundEnhancers<-toGRanges("USP21Enhancers.bed") 
-
-### Set of peaks to test ###
-PeakSet<-toGRanges("H2AK119ub1SpermPeaks.bed")
-
-##----------------------##
-#### PERMUTATION TEST ####
-##----------------------##
-
-pdf(file = "EnrichmentUSP21ReplicatedU21.pdf",width=10,height=10)
-
-# Overlap of 10000 resampling of TSS from USP21 sensitive genes over all TSS with H2AK119ub1 sperm peaks
-ptTSS<-permTest(A=BackgroundTSS, ntimes=10000,count.once = TRUE, randomize.function=resampleRegions,evaluate.function=numOverlaps, B=PeakSet,allow.overlaps = TRUE, verbose=T,universe = UniverseTSS)
-summary(ptTSS)
-plot(ptTSS)
-
-# Overlap of 10000 resampling of Gene body from USP21 sensitive genes over all Genes body with H2AK119ub1 sperm peaks
-ptGenes<-permTest(A=BackgroundGenes, ntimes=10000,count.once = TRUE, randomize.function=resampleRegions,evaluate.function=numOverlaps, B=PeakSet,allow.overlaps = TRUE, verbose=T,universe = UniverseGenes)
-summary(ptGenes)
-plot(ptGenes)
-
-# Overlap of 10000 resampling of Enhancers associated with USP21 sensitive genes over all enhancers with H2AK119ub1 sperm peaks
-ptEnhancers<-permTest(A=BackgroundEnhancers, ntimes=10000,count.once = TRUE, randomize.function=resampleRegions,evaluate.function=numOverlaps, B=PeakSet,allow.overlaps = TRUE, verbose=T,universe = UniverseEnhancers)
-summary(ptEnhancers)
-plot(ptEnhancers)
-
-dev.off()
-
-##------------------------##
-#### RANDOMISATION TEST ####
-##------------------------##
-
-gen<-toGRanges("~/These/Analyses/GFF/XL9_Chromosomes.bed")
-pdf(file = "EnrichmentTestFig_CpG_repeats_CO.pdf",width=10,height=10)
-
-PeakSet<-toGRanges("Egg-U21_only.bed")
-CpG<-toGRanges("cpgIslandExt.bed")
-# 1000 randomization of peaks over the genome computing overlap over CpG islands
-FigCpG<-permTest(A=PeakSet, B=CpG, ntimes=1000, randomize.function=randomizeRegions, evaluate.function=numOverlaps, count.once=TRUE, genome=gen, allow.overlaps = TRUE,verbose=T)
-summary(FigCpG)
-plot(FigCpG)
-
-repeats<-toGRanges("repeats.bed")
-# 1000 randomization of peaks over the genome computing overlap over repeats elements
-Figrepeats<-permTest(A=PeakSet, B=repeats, ntimes=1000, randomize.function=randomizeRegions, evaluate.function=numOverlaps, count.once=TRUE, genome=gen, allow.overlaps = TRUE,verbose=T)
-summary(Figrepeats)
-plot(Figrepeats)
-
-# 1000 randomization of peaks over the genome computing overlap over intergenic regions (same protocol with Exon, Intron, TSS, Genebody...)
-IntergenicRegions<-toGRanges("intergenic.bed") 
-FigIntergenic<-permTest(A=IntergenicRegions, B=PeakSet, ntimes=1000, randomize.function=randomizeRegions, evaluate.function=numOverlaps, count.once=FALSE, genome=gen, allow.overlaps = TRUE,verbose=T)
-summary(FigIntergenic)
-plot(FigIntergenic)
-
-dev.off()
-
-##--------------------------##
-#### TF MOTIF DOT HEATMAP ####
-##--------------------------##
-
-source("https://gitlab.univ-nantes.fr/E114424Z/veneR/raw/master/loadFun.R?inline=false")
-
-library(patchwork) 
-library(cowplot)
-library(ggtree)
-library(theme_cowplot)
-library(viridis)
-library(ggrepel)
-setwd("C:/Users/ValentinFC/Desktop/Article/IGV")
-
-### Process findMotif.pl and setup file input
-pdf("DotHeatmapHOMERFilter.pdf",width = 100,height=100)
-
-gene_cluster <- read.tsv("../HomerLogPValueInf5.tsv")
-ggplot(gene_cluster, aes(x=Cluster, y = MOTIF_NAME, size = log10(1-MinlogP.Value), color=as.numeric(Percentage_motif))) + 
-  geom_point() +  
-  ylab("GeneMotif") + 
-  scale_colour_gradientn(colours = c("red","blue","green"),values = c(0,0.1,1), limits=c(0, 100))
-
-dev.off()
-
-##---------------------##
-#### PEAK ANNOTATION ####
-##---------------------##
-
-library(ChIPseeker)
-library(clusterProfiler)
-library(GenomicFeatures)
-txdb<-makeTxDbFromGFF("~/These/Analyses/GFF/XENLA_9.2_Xenbase.gtf")
-setwd("C:/Users/ValentinFC/Desktop/Article/IGV")
-
-promoter <- getPromoters(TxDb=txdb, upstream=5000, downstream=5000)
-cntdir <- "./"
-pat <- "_0.001.bed"
-myfiles <- list.files(path = cntdir,
-                      pattern = pat,
-                      all.files = TRUE,
-                      recursive = FALSE,
-                      ignore.case = FALSE,
-                      include.dirs = FALSE)
-pdf(file="ChipSeekerHMMGroups.pdf",width=10,height=10)
-for (i in 1:length(myfiles)) {
-  peakAnno <- annotatePeak(myfiles[[i]], tssRegion=c(-5000, 5000),TxDb=txdb)
-  plotAnnoPie(peakAnno)
+.load_pkg <- function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager")
+    BiocManager::install(pkg, ask = FALSE)
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }
+
+for (pkg in c("GenomicFeatures", "GenomicRanges", "ChIPseeker",
+              "genomation", "regioneR", "clusterProfiler",
+              "patchwork", "cowplot", "viridis", "ggrepel",
+              "ggplot2", "dplyr", "RHmm")) {
+  .load_pkg(pkg)
+}
+
+
+# =============================================================================
+# PARAMETERS — edit here
+# =============================================================================
+
+DATA_DIR   <- "."            # working directory (BED / TSV files)
+GFF_DIR    <- "GFF"          # GTF + chromosome BED directory
+FIGURES_DIR <- "Figures/ChIPseq"
+
+N_PERM_USP21 <- 10000        # permutations for USP21 overlap tests
+N_PERM_RND   <- 1000         # randomisations for genomic feature tests
+
+# TSS profile parameters (deepTools plotProfile output)
+TSS_FLANK_BINS <- c(81, 120) # BorneDown:BorneUp — 1 kb around TSS at binsize 50
+TSS_ROW_COMPARE <- 37        # row index: sample to compare (MZ genes)
+TSS_ROW_BASELINE <- 42       # row index: baseline (All genes)
+
+# HMM parameters
+HMM_STATES   <- 2
+HMM_CHUNK    <- 4000         # chunk size for Viterbi decoding
+
+create_dir <- function(path) {
+  if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+}
+create_dir(FIGURES_DIR)
+
+
+# =============================================================================
+# I. PERMUTATION TESTS — USP21-sensitive gene overlap with H2AK119ub1 peaks
+# =============================================================================
+
+message("[1/7] Permutation tests — USP21 gene overlap...")
+
+# Genomic universes
+universe_tss       <- toGRanges(file.path(DATA_DIR, "Genes9_2TSS5Kb_chrosomose.bed"))
+universe_genes     <- toGRanges(file.path(DATA_DIR, "Genes9_2_chrosomose.bed"))
+universe_enhancers <- toGRanges(file.path(DATA_DIR, "Genes9_2Enhancers_chrosomose.bed"))
+
+# USP21-sensitive gene sets
+bg_tss       <- toGRanges(file.path(DATA_DIR, "USP21TSS_chr.bed"))
+bg_genes     <- toGRanges(file.path(DATA_DIR, "USP21Genes.bed"))
+bg_enhancers <- toGRanges(file.path(DATA_DIR, "USP21Enhancers.bed"))
+
+# Peak set
+peak_set <- toGRanges(file.path(DATA_DIR, "H2AK119ub1SpermPeaks.bed"))
+
+pdf(file.path(FIGURES_DIR, "EnrichmentUSP21ReplicatedU21.pdf"),
+    width = 10, height = 10)
+
+pt_tss <- permTest(
+  A = bg_tss, B = peak_set,
+  ntimes = N_PERM_USP21, count.once = TRUE,
+  randomize.function = resampleRegions,
+  evaluate.function  = numOverlaps,
+  universe = universe_tss,
+  allow.overlaps = TRUE, verbose = TRUE
+)
+summary(pt_tss); plot(pt_tss)
+
+pt_genes <- permTest(
+  A = bg_genes, B = peak_set,
+  ntimes = N_PERM_USP21, count.once = TRUE,
+  randomize.function = resampleRegions,
+  evaluate.function  = numOverlaps,
+  universe = universe_genes,
+  allow.overlaps = TRUE, verbose = TRUE
+)
+summary(pt_genes); plot(pt_genes)
+
+pt_enhancers <- permTest(
+  A = bg_enhancers, B = peak_set,
+  ntimes = N_PERM_USP21, count.once = TRUE,
+  randomize.function = resampleRegions,
+  evaluate.function  = numOverlaps,
+  universe = universe_enhancers,
+  allow.overlaps = TRUE, verbose = TRUE
+)
+summary(pt_enhancers); plot(pt_enhancers)
+
 dev.off()
+message("  Saved: EnrichmentUSP21ReplicatedU21.pdf")
 
-##------------------------------------##
-##### R Script TSS Profile P-Value #####
-##------------------------------------##
 
-library(dplyr)
-setwd("C:/Users/ValentinFC/Desktop/Article/IGV")
-#Formated Output from -outFileNameData argument in plotProfile function https://deeptools.readthedocs.io/en/develop/content/tools/plotProfile.html, in tsv format (each line is a sample, each column is a bin)
+# =============================================================================
+# II. RANDOMISATION TESTS — CpG islands, repeats, genomic features
+# =============================================================================
 
-table <- lire("Droso_USP21Sensitive_LadderH2Aub.tsv")
-# Select x Kb region around TSS depending binsize and how many bins you pick (here 1kb around TSS, 20% bins before and after TSS)
-BorneDown <- 81
-BorneUp <- 120
-# Select sample to compare
-ToCompare <- 37
-BaseLine <-42
+message("[2/7] Randomisation tests — CpG / repeats / intergenic...")
 
-# Select and convert value into numeric
-NormalState <- as.numeric(table[BaseLine,c(BorneDown:BorneUp)])
-ComparedState <- as.numeric(table[ToCompare,c(BorneDown:BorneUp)])
+genome_gr <- toGRanges(file.path(GFF_DIR, "XL9_Chromosomes.bed"))
+peak_u21  <- toGRanges(file.path(DATA_DIR, "Egg-U21_only.bed"))
+cpg       <- toGRanges(file.path(DATA_DIR, "cpgIslandExt.bed"))
+repeats   <- toGRanges(file.path(DATA_DIR, "repeats.bed"))
+intergenic <- toGRanges(file.path(DATA_DIR, "intergenic.bed"))
 
-# Dataframe formating for test processing
-my_data <- data.frame(group = rep(c("AllGenes", "MZ"), each = length(NormalState)), values = c(NormalState, ComparedState))
+pdf(file.path(FIGURES_DIR, "EnrichmentTestFig_CpG_repeats_CO.pdf"),
+    width = 10, height = 10)
 
-# Paired wilcoxon Mann-Whitney test
-wilcox.test(values ~ group, data = my_data, paired = TRUE,alternative="less")
+for (test_cfg in list(
+  list(A = peak_u21,  B = cpg,        label = "CpG islands"),
+  list(A = peak_u21,  B = repeats,    label = "Repeats"),
+  list(A = intergenic, B = peak_u21,  label = "Intergenic regions")
+)) {
+  res <- permTest(
+    A = test_cfg$A, B = test_cfg$B,
+    ntimes = N_PERM_RND,
+    randomize.function = randomizeRegions,
+    evaluate.function  = numOverlaps,
+    count.once = TRUE, genome = genome_gr,
+    allow.overlaps = TRUE, verbose = TRUE
+  )
+  summary(res); plot(res, main = test_cfg$label)
+}
 
-# Extract number of value, median and IQR for each sample
-group_by(my_data, group) %>%
-  summarise(
-    count = n(),
-    median = median(values, na.rm = TRUE),
-    IQR = IQR(values, na.rm = TRUE)
+dev.off()
+message("  Saved: EnrichmentTestFig_CpG_repeats_CO.pdf")
+
+
+# =============================================================================
+# III. TF MOTIF DOT HEATMAP (HOMER findMotifs.pl output)
+# =============================================================================
+
+message("[3/7] TF motif dot heatmap...")
+
+motif_file <- file.path(DATA_DIR, "HomerLogPValueInf5.tsv")
+if (file.exists(motif_file)) {
+  gene_cluster <- read.table(motif_file, header = TRUE,
+                              sep = "\t", stringsAsFactors = FALSE)
+  p <- ggplot(gene_cluster,
+              aes(x = Cluster, y = MOTIF_NAME,
+                  size  = log10(1 - MinlogP.Value),
+                  color = as.numeric(Percentage_motif))) +
+    geom_point() +
+    ylab("Gene Motif") +
+    scale_colour_gradientn(
+      colours = c("red", "blue", "green"),
+      values  = c(0, 0.1, 1),
+      limits  = c(0, 100),
+      name    = "% Motif"
+    ) +
+    labs(size = "log10(1 - p-value)") +
+    theme_bw(base_size = 8)
+
+  pdf(file.path(FIGURES_DIR, "DotHeatmapHOMERFilter.pdf"),
+      width = 100, height = 100)
+  print(p)
+  dev.off()
+  message("  Saved: DotHeatmapHOMERFilter.pdf")
+} else {
+  warning("HOMER motif file not found: ", motif_file, " — skipping.")
+}
+
+
+# =============================================================================
+# IV. PEAK ANNOTATION WITH CHIPSEEKER
+# =============================================================================
+
+message("[4/7] Peak annotation with ChIPseeker...")
+
+txdb <- makeTxDbFromGFF(file.path(GFF_DIR, "XENLA_9.2_Xenbase.gtf"))
+promoter <- getPromoters(TxDb = txdb, upstream = 5000, downstream = 5000)
+
+peak_files <- list.files(
+  path       = DATA_DIR,
+  pattern    = "_0.001.bed$",
+  full.names = TRUE
+)
+
+if (length(peak_files) == 0) {
+  warning("No *_0.001.bed files found in: ", DATA_DIR)
+} else {
+  pdf(file.path(FIGURES_DIR, "ChipSeekerHMMGroups.pdf"),
+      width = 10, height = 10)
+  for (f in peak_files) {
+    message("  Annotating: ", basename(f))
+    peak_anno <- annotatePeak(f,
+                               tssRegion = c(-5000, 5000),
+                               TxDb = txdb)
+    plotAnnoPie(peak_anno)
+  }
+  dev.off()
+  message("  Saved: ChipSeekerHMMGroups.pdf")
+}
+
+
+# =============================================================================
+# V. TSS PROFILE P-VALUE (Wilcoxon) from deepTools plotProfile output
+# =============================================================================
+
+message("[5/7] TSS profile Wilcoxon test...")
+
+profile_file <- file.path(DATA_DIR, "Droso_USP21Sensitive_LadderH2Aub.tsv")
+if (file.exists(profile_file)) {
+  tbl <- read.table(profile_file, header = FALSE,
+                    sep = "\t", stringsAsFactors = FALSE)
+  # BorneDown:BorneUp selects ~1 kb around TSS (binsize 50 bp)
+  bins         <- TSS_FLANK_BINS[1]:TSS_FLANK_BINS[2]
+  baseline     <- as.numeric(tbl[TSS_ROW_BASELINE, bins])
+  compared     <- as.numeric(tbl[TSS_ROW_COMPARE,  bins])
+
+  my_data <- data.frame(
+    group  = rep(c("AllGenes", "MZ"), each = length(baseline)),
+    values = c(baseline, compared)
   )
 
-##-------------------------------------------------------##
-##### R Script PValues : Output a .probabilities file #####
-##-------------------------------------------------------##
+  wt <- wilcox.test(values ~ group, data = my_data,
+                    paired = TRUE, alternative = "less")
+  message("  Wilcoxon p-value (MZ vs All): ", signif(wt$p.value, 4))
 
-## PART1 : PValue calculating
+  stats <- group_by(my_data, group) %>%
+    summarise(n      = n(),
+              median = median(values, na.rm = TRUE),
+              IQR    = IQR(values,    na.rm = TRUE),
+              .groups = "drop")
+  print(stats)
+} else {
+  warning("Profile TSV not found: ", profile_file, " — skipping.")
+}
 
-## H2A vs NoH2A
-test150_110 = seq(1,length(FragmentLen$V1))
-test70 = seq(1,length(FragmentLen$V1))
-f150_110 <- 0.5*(colSums(FragmentLen[,c(4:7)])[1]/colSums(FragmentLen[,c(4:7)])[4]+colSums(FragmentLen[,c(4:7)])[2]/colSums(FragmentLen[,c(4:7)])[4])
-f70 <- colSums(FragmentLen[,c(4:7)])[3]/colSums(FragmentLen[,c(4:7)])[4] 
 
-for (i in 1:length(FragmentLen$V1)){
-  if(i%%50000 == 0){
-    print(i)}
-  if(FragmentLen[i,7]>0){
-    test150_110[i] <- prop.test((FragmentLen[i,4]+FragmentLen[i,5]),FragmentLen[i,7],p=f150_110,alternative = "greater")$p.value
-    test70[i] <- prop.test(FragmentLen[i,6],FragmentLen[i,7],p=f70,alternative = "greater")$p.value
-  } else {
-    test150_110[i] <- 1
-    test70[i] <- 1
+# =============================================================================
+# VI. PROPORTION TESTS — H2A vs non-H2A / Nucl vs sub-nucl per genomic bin
+# Output: .probabilities file read by H2A_enrichment.sh downstream
+# =============================================================================
+
+message("[6/7] Proportion tests (H2A / Nucl models)...")
+
+#' Run proportion tests on a fragment count bedgraph
+#'
+#' @param frag_file Character. Path to 7-column bedgraph:
+#'   chr, start, end, count_A, count_B, count_C, total
+#' @param model     Character. "H2A" or "Nucl".
+#' @return Invisible NULL. Writes .probabilities file.
+run_proportion_tests <- function(frag_file, model = c("H2A", "Nucl")) {
+  model <- match.arg(model)
+  if (!file.exists(frag_file)) {
+    warning("Fragment file not found: ", frag_file, " — skipping.")
+    return(invisible(NULL))
   }
+  message("  Model: ", model, " | File: ", basename(frag_file))
+
+  frag <- read.table(frag_file, header = FALSE, sep = "\t",
+                     stringsAsFactors = FALSE)
+  colnames(frag) <- c("Chr", "Start", "End", "C150", "C110", "C70", "Total")
+  n <- nrow(frag)
+
+  if (model == "H2A") {
+    # H2A-positive (C150 + C110) vs H2A-negative (C70)
+    col_sum <- colSums(frag[, 4:7])
+    f_h2a   <- 0.5 * (col_sum[1] / col_sum[4] + col_sum[2] / col_sum[4])
+    f_non   <- col_sum[3] / col_sum[4]
+    p_h2a   <- numeric(n)
+    p_non   <- numeric(n)
+    for (i in seq_len(n)) {
+      if (i %% 50000 == 0) message("    Row: ", i, " / ", n)
+      if (frag$Total[i] > 0) {
+        p_h2a[i] <- prop.test(frag$C150[i] + frag$C110[i], frag$Total[i],
+                               p = f_h2a, alternative = "greater")$p.value
+        p_non[i] <- prop.test(frag$C70[i], frag$Total[i],
+                               p = f_non,  alternative = "greater")$p.value
+      } else {
+        p_h2a[i] <- 1
+        p_non[i] <- 1
+      }
+    }
+    out <- cbind(frag,
+                 (frag$C150 + frag$C110) / frag$Total,
+                 frag$C70 / frag$Total,
+                 p_h2a, p_non, 1)
+    suffix <- "_H2A_vs_NonH2A.probabilities"
+
+  } else {
+    # Nucleosome (C150) vs sub-nucleosome (C110 + C70)
+    col_sum  <- colSums(frag[, 4:7])
+    f_nucl   <- col_sum[1] / col_sum[4]
+    f_semi   <- 0.5 * (col_sum[2] / col_sum[4] + col_sum[3] / col_sum[4])
+    p_nucl   <- numeric(n)
+    p_semi   <- numeric(n)
+    for (i in seq_len(n)) {
+      if (i %% 50000 == 0) message("    Row: ", i, " / ", n)
+      if (frag$Total[i] > 0) {
+        p_nucl[i] <- prop.test(frag$C150[i], frag$Total[i],
+                                p = f_nucl, alternative = "greater")$p.value
+        p_semi[i] <- prop.test(frag$C110[i] + frag$C70[i], frag$Total[i],
+                                p = f_semi, alternative = "greater")$p.value
+      } else {
+        p_nucl[i] <- 1
+        p_semi[i] <- 1
+      }
+    }
+    out <- cbind(frag,
+                 frag$C150 / frag$Total,
+                 (frag$C110 + frag$C70) / frag$Total,
+                 p_nucl, p_semi, 1)
+    suffix <- "_Nucl_vs_SemiNucl.probabilities"
+  }
+
+  out_file <- paste0(sub("\\.bedgraph$", "", frag_file), suffix)
+  write.table(out, file = out_file,
+              sep = "\t", quote = FALSE,
+              col.names = FALSE, row.names = FALSE)
+  message("  Saved: ", basename(out_file))
+  invisible(NULL)
 }
-pval = cbind(test150_110, test70)
-write.table(cbind(FragmentLen,((FragmentLen$V4+FragmentLen$V5)/FragmentLen$V7),(FragmentLen$V6/FragmentLen$V7),pval,1),file=paste0(FragmentLenFile,"_H2A_vs_NonH2A.probabilities",sep=""),sep = '\t',quote = F,col.names = F,row.names = F)
 
-## Nucl vs seminucl
-test150 = seq(1,length(FragmentLen$V1))
-test110_70 = seq(1,length(FragmentLen$V1))
-f150 <- colSums(FragmentLen[,c(4:7)])[1]/colSums(FragmentLen[,c(4:7)])[4] 
-f110_70 <- 0.5*(colSums(FragmentLen[,c(4:7)])[2]/colSums(FragmentLen[,c(4:7)])[4]+colSums(FragmentLen[,c(4:7)])[3]/colSums(FragmentLen[,c(4:7)])[4])
-
-for (i in 1:length(FragmentLen$V1)){
-  if(i%%50000 == 0){ print(i)}
-  if(FragmentLen[i,7]>0){
-    test110_70[i] <- prop.test((FragmentLen[i,5]+FragmentLen[i,6]),FragmentLen[i,7],p=f110_70,alternative = "greater")$p.value
-    test150[i] <- prop.test(FragmentLen[i,4],FragmentLen[i,7],p=f150,alternative = "greater")$p.value
-  }else{
-    test110_70[i] <- 1
-    test150[i] <- 1
-  }}
-pval = cbind(test150, test110_70)
-write.table(cbind(FragmentLen,(FragmentLen$V4/FragmentLen$V7),((FragmentLen$V5+FragmentLen$V6)/FragmentLen$V7),pval,1),file=paste0(FragmentLenFile,"_Nucl_vs_SemiNucl.probabilities",sep=""),sep = '\t',quote = F,col.names = F,row.names = F)
+run_proportion_tests(
+  file.path(DATA_DIR,
+    "Fragment/Input_Sp_WithoutDupl.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NonH2A.full.bedgraph"),
+  model = "H2A"
+)
+run_proportion_tests(
+  file.path(DATA_DIR,
+    "Fragment/Input_Sp_WithoutDupl.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.full.bedgraph"),
+  model = "Nucl"
+)
 
 
-##--------------------------##
-##### R Script HMM Model #####
-##--------------------------##
+# =============================================================================
+# VII. HIDDEN MARKOV MODEL — chromatin state assignment on fragment probs
+# =============================================================================
 
-##PART2 : HMM##
-library("RHmm")
-HMMFile<-"../AlreadyDone/Input.Fragm150_110_70_sum_nodup_above5_slid50.full.bedgraph.probabilities.discrete"
-HMM <- read.table(HMMFile, stringsAsFactors = F, sep = "\t", header = F)
-colnames(HMM)<-c("Chr","Begin","End","Count150","Count110","Count70","TotalCount","%150","%110","%70","p150","p110","p70","obs150","obs110","obs70")
-range<-4000
-test_obs <- HMM
-test_obs[is.na(test_obs)] <- 0
-hmmfit<- HMMFit(test_obs, nStates= 2, dis= 'DISCRETE')
-lim<-seq(1,len(test_obs),by = range)
-lim[len(lim)]<-len(test_obs)+1
-states<-c()
-for(i in 1:(len(lim)-1)){
-  vit<-viterbi(hmmfit, test_obs[lim[i]:(lim[i+1]-1)])
-  states<-c(states,vit$states)
+message("[7/7] HMM state assignment (RHmm)...")
+
+hmm_file <- file.path(DATA_DIR,
+  "Fragment/Input.Fragm150_110_70_sum_nodup_above5_slid50.full.bedgraph.probabilities.discrete")
+
+if (file.exists(hmm_file)) {
+  hmm_data <- read.table(hmm_file, stringsAsFactors = FALSE,
+                          sep = "\t", header = FALSE)
+  colnames(hmm_data) <- c(
+    "Chr", "Begin", "End",
+    "Count150", "Count110", "Count70", "TotalCount",
+    "Pct150", "Pct110", "Pct70",
+    "p150", "p110", "p70",
+    "obs150", "obs110", "obs70"
+  )
+  hmm_data[is.na(hmm_data)] <- 0
+
+  message("  Fitting HMM (", HMM_STATES, " states)...")
+  hmm_fit <- HMMFit(hmm_data, nStates = HMM_STATES, dis = "DISCRETE")
+
+  # Chunked Viterbi decoding (avoids memory issues on large datasets)
+  n      <- nrow(hmm_data)
+  breaks <- c(seq(1, n, by = HMM_CHUNK), n + 1)
+  states <- c()
+  for (i in seq_len(length(breaks) - 1)) {
+    chunk  <- hmm_data[breaks[i]:(breaks[i + 1] - 1), ]
+    vit    <- viterbi(hmm_fit, chunk)
+    states <- c(states, vit$states)
+  }
+
+  out_hmm <- file.path(DATA_DIR,
+    "Fragment/Input.Fragm150_above5_hmm_state_50bpw.full")
+  write.table(states, file = out_hmm,
+              sep = "\t", quote = FALSE,
+              col.names = FALSE, row.names = FALSE)
+  message("  HMM states saved: ", basename(out_hmm))
+} else {
+  warning("HMM input file not found: ", hmm_file, " — skipping.")
 }
-write.table(states,file="Input.Fragm150_above5_hmm_state_50bpw.full",sep = '\t',quote = F,col.names = F,row.names = F)
 
+message("ProcessingChIPdata complete.")
