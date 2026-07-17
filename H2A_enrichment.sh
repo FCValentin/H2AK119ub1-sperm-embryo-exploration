@@ -1,181 +1,431 @@
+#!/usr/bin/env bash
+# =============================================================================
+# H2A_enrichment.sh
+# -----------------------------------------------------------------------------
+# H2AK119ub1 particle enrichment detection from sperm Input ChIP-seq data.
+# Classifies reads by fragment size into nucleosomal / sub-nucleosomal /
+# H2A-positive / H2A-negative fractions, computes per-bin coverage,
+# runs proportion tests (via ProcessingChIPdata.R — standalone R script),
+# discretises p-values into BED intervals, and generates spike-in normalised
+# BigWig tracks and deepTools profiles.
+#
+# Languages used:
+#   Bash    — orchestration (this file)
+#   R       — proportion tests + HMM (ProcessingChIPdata.R, run separately)
+#   Java    — bedGraphToBigWig is a C binary; UCSC tool
+#
+# Workflow:
+#   1.  Fragment size classification (awk — nucleosome / H2A model)
+#   2.  Per-bin coverage (bedtools intersect, 250 bp bin / 50 bp slide)
+#   3.  NOTE: proportion tests run via: Rscript ProcessingChIPdata.R
+#   4.  P-value discretisation + BED merging at multiple FDR thresholds
+#   5.  Per-chromosome coverage of enriched/depleted regions
+#   6.  Intersection with H2AK119ub1 peaks
+#   7.  Fragment subset extraction + BAM generation per fraction
+#   8.  Fragment size QC per fraction (bamPEFragmentSize)
+#   9.  log2 ratio BigWig tracks (bamCompare)
+#   10. 601 DNA ladder spike-in normalisation + BigWig
+#   11. deepTools computeMatrix + plotProfile (ladder-normalised profiles)
+#
+# Author  : Valentin FRANCOIS--CAMPION, PhD
+# Contact : valentin.francoiscampion@gmail.com
+# GitHub  : https://github.com/FCValentin/H2AK119ub1-sperm-embryo-exploration
+# Paper   : François-Campion V. et al., Nature Communications, 2025
+#           DOI: 10.1038/s41467-025-58615-7
+# =============================================================================
+
 #$ -S /bin/bash
 #$ -cwd
 #$ -V
 #$ -q max-1m.q
-#$ -e  ./log/
+#$ -e ./log/
 #$ -o ./log/
 
-#3 is chr name, 4 begin of pos, 4+50 begin add length read, 1 is the name of read and abs($9) for fragment Length (TLEN) (distance 5' mate 1 3' mate 2 en paired end)
-samtools view Merged/Input_Sp_WithoutDupl.sort.bam | awk '{print $3"\t"$4"\t"$4+50"\t"$1"\t"sqrt(($9)^2)}' > Merged/Input_Sp_WithoutDupl.sort.bed
-samtools sort -n Merged/Input_Sp_WithoutDupl.sort.bam | samtools fixmate | bedtools bamtobed -bedpe > Merged/Input_Sp_WithoutDupl-bis.sort.bed
-awk '{ if($5>135) print $0"\t"1; else if($5>30 && $5<=135) print $0"\t"2; else if($5<=30) print $0"\t"0}' Merged/Input_Sp_WithoutDupl.sort.bed > Merged/Input_Sp_WithoutDupl_flagNucl.bed
-awk '{ if($5>95) print $0"\t"1; else if($5>30 && $5<=95) print $0"\t"2; else if($5<=30) print $0"\t"0}' Merged/Input_Sp_WithoutDupl.sort.bed > Merged/Input_Sp_WithoutDupl_H2A.bed
+set -euo pipefail
 
-#selection of fragment length based on Fragment size output figure (BamPEFragmentsize)
-awk '{ if($5<=90 && $5>50) print $0"\t"70; else if($5>140 && $5<165) print $0"\t"150; else if($5>100 && $5<=130) print $0"\t"110; else print $0"\t"0}' Merged/Input_Sp_WithoutDupl.sort.bed > Merged/Input_Sp_WithoutDupl_flag.bed
+# =============================================================================
+# PARAMETERS — edit here
+# =============================================================================
 
-#split the flagged BEDPE file in 2 independant bed files depending H2A
-nohup grep $'\t'1$ Merged/Input_Sp_WithoutDupl_flagNucl.bed | sort -k 1,1 -k2,2n > Merged/Input_Sp_WithoutDupl_Nucl.bed
-nohup grep $'\t'2$ Merged/Input_Sp_WithoutDupl_flagNucl.bed | sort  -k 1,1 -k2,2n > Merged/Input_Sp_WithoutDupl_SubNucl.bed
-nohup grep $'\t'1$ Merged/Input_Sp_WithoutDupl_H2A.bed | sort -k 1,1 -k2,2n > Merged/Input_Sp_WithoutDupl_H2APos.bed
-nohup grep $'\t'2$ Merged/Input_Sp_WithoutDupl_H2A.bed | sort  -k 1,1 -k2,2n > Merged/Input_Sp_WithoutDupl_H2ANeg.bed
+SAMPLE="Input_Sp_WithoutDupl"
+GENOME_BIN="Genome/XLaevis_250bpbin_slid50.bed"
+CHROM_BED="GFF/XL9_Chromosomes.bed"
+CHROM_SIZES="chromSizesXL9.bed"
+PEAKS="Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed"
 
-#coverage of fragment length reads on each genome bins
-bedtools intersect -sorted -a Genome/XLaevis_250bpbin_slid50.bed -b Merged/Input_Sp_WithoutDupl_Nucl.bed -c > Fragment/Input_Sp_WithoutDupl_Nucl_slid50.bed
-bedtools intersect -sorted -a Genome/XLaevis_250bpbin_slid50.bed -b Merged/Input_Sp_WithoutDupl_SubNucl.bed -c > Fragment/Input_Sp_WithoutDupl_SubNucl_slid50.bed
-bedtools intersect -sorted -a Genome/XLaevis_250bpbin_slid50.bed -b Merged/Input_Sp_WithoutDupl_H2APos.bed -c > Fragment/Input_Sp_WithoutDupl_H2APos_slid50.bed
-bedtools intersect -sorted -a Genome/XLaevis_250bpbin_slid50.bed -b Merged/Input_Sp_WithoutDupl_H2ANeg.bed -c > Fragment/Input_Sp_WithoutDupl_H2ANeg_slid50.bed
+# 601 DNA spike-in counts — update from idxstats output
+CHIP_601_READS=10807
+INPUT_601_READS=484
+LADDER_RATIO=$(echo "scale=6; ${INPUT_601_READS}/${CHIP_601_READS}" | bc)
 
-#Format setup
-paste Fragment/Input_Sp_WithoutDupl_Nucl_slid50.bed Fragment/Input_Sp_WithoutDupl_SubNucl_slid50.bed | awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t"($4+$8)}' > Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_Nucl_vs_SemiNucl.full.bedgraph
-awk '{if($6>=5) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_Nucl_vs_SemiNucl.full.bedgraph > Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.full.bedgraph
-paste Fragment/Input_Sp_WithoutDupl_H2APos_slid50.bed Fragment/Input_Sp_WithoutDupl_H2ANeg_slid50.bed | awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t"($4+$8)}' > Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_H2A_vs_NonH2A.full.bedgraph
-awk '{if($6>=5) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_H2A_vs_NoH2A.full.bedgraph > Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.full.bedgraph
+THREADS=4
+MAPQ=20
+MIN_FRAG_READS=5     # min total reads per bin for analysis
 
-############################################################################################
-##### R Script PValues : Output a .probabilities file : check ProcessingChIPdata.R #########
-############################################################################################
+# FDR thresholds for BED discretisation
+PVAL_LABELS=(0.1 0.05 0.001)
 
-# P-Value discretisation
-awk '
-    {
-    if ($6>0) {p1=0;p2=0}
-    if($6>0 && $9>0.1) {p1=0;}
-    if($6>0 && $9<=0.1 && $9>0.05) {p1=1;} 
-    if($6>0 && $9<=0.05 && $9>0.001) {p1=2;}
-    if($6>0 && $9<=0.001){p1=3;}
-    if($6>0 && $10>0.1) {p2=0;}
-    if($6>0 && $10<=0.1 && $10>0.05) {p2=1;} 
-    if($6>0 && $10<=0.05 && $10>0.001) {p2=2;}
-    if($6>0 && $10<=0.001){p2=3;}
-    print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"p1"\t"p2}
-' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities >  Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete
+# =============================================================================
+# I. DIRECTORY SETUP
+# =============================================================================
 
-awk '
-    {
-    if ($6>0) {p1=0;p2=0}
-    if($6>0 && $9>0.1) {p1=0;}
-    if($6>0 && $9<=0.1 && $9>0.05) {p1=1;} 
-    if($6>0 && $9<=0.05 && $9>0.001) {p1=2;}
-    if($6>0 && $9<=0.001){p1=3;}
-	if($6>0 && $9<=0.0001 && $9>0.00001){p1=4;}
-	if($6>0 && $9<=0.00001){p1=5;}
-    if($6>0 && $10>0.1) {p2=0;}
-    if($6>0 && $10<=0.1 && $10>0.05) {p2=1;} 
-    if($6>0 && $10<=0.05 && $10>0.001) {p2=2;}
-    if($6>0 && $10<=0.001 && $10>0.0001){p2=3;}
-	if($6>0 && $10<=0.0001 && $10>0.00001){p2=4;}
-	if($6>0 && $10<=0.00001){p2=5;}
-    print $1"\t"$2"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8"\t"$9"\t"$10"\t"p1"\t"p2}
-' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities >  Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete
+mkdir -p Merged Fragment IGV Coverage DNALadder FragmentSize
 
-###############################################################
-##### R Script HMM Model : check ProcessingChIPdata.R #########
-###############################################################
+# =============================================================================
+# II. FRAGMENT SIZE CLASSIFICATION (awk)
+# =============================================================================
 
-#Merged bins that overlap between them into a unique one, at different discrete p-value level 
-awk '{if($11>0) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Aenriched_0.1.bed
-awk '{if($12>0) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Adepleted_0.1.bed
-awk '{if($11>0) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeEnriched_0.1.bed
-awk '{if($12>0) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeDepleted_0.1.bed
+echo "[1/11] Classifying reads by fragment size (TLEN)..."
 
-awk '{if($11>1) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Aenriched_0.05.bed
-awk '{if($12>1) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Adepleted_0.05.bed
-awk '{if($11>1) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeEnriched_0.05.bed
-awk '{if($12>1) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeDepleted_0.05.bed
+# Convert sorted BAM to BED with absolute fragment length in col 5
+samtools view "Merged/${SAMPLE}.sort.bam" \
+    | awk '{print $3"\t"$4"\t"$4+50"\t"$1"\t"sqrt(($9)^2)}' \
+    > "Merged/${SAMPLE}.sort.bed"
 
-awk '{if($11>2) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Aenriched_0.001.bed
-awk '{if($12>2) print $0}' Fragment/Input.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities.discrete | mergeBed > IGV/H2Adepleted_0.001.bed
-awk '{if($11>2) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeEnriched_0.001.bed
-awk '{if($12>2) print $0}' Fragment/Input.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities.discrete | mergeBed > IGV/NucleosomeDepleted_0.001.bed
+# Nucleosome model: >135 bp = nucleosome(1), 31-135 = sub-nucleosomal(2)
+awk '{
+    if      ($5 > 135)                   print $0"\t1"
+    else if ($5 >  30 && $5 <= 135)      print $0"\t2"
+    else                                 print $0"\t0"
+}' "Merged/${SAMPLE}.sort.bed" > "Merged/${SAMPLE}_flagNucl.bed"
 
-#Compute genome coverage of each particle enrichment
-for f in `ls -1 IGV/Nucl*_*.bed | cut -d "/" -f 2 | sed 's/.bed//'`
-	do bedtools coverage -a ../GFF/XL9_Chromosomes.bed -b IGV/${f}.bed > Coverage/Coverage_${f}.bed
+# H2A model: >95 bp = H2A-positive(1), 31-95 = H2A-negative(2)
+awk '{
+    if      ($5 > 95)                    print $0"\t1"
+    else if ($5 >  30 && $5 <= 95)       print $0"\t2"
+    else                                 print $0"\t0"
+}' "Merged/${SAMPLE}.sort.bed" > "Merged/${SAMPLE}_H2A.bed"
+
+# Split nucleosome model into two BED files
+for flag_val in 1 2; do
+    label=$([ "${flag_val}" -eq 1 ] && echo "Nucl" || echo "SubNucl")
+    grep $'\t'"${flag_val}"'$' "Merged/${SAMPLE}_flagNucl.bed" \
+        | sort -k1,1 -k2,2n \
+        > "Merged/${SAMPLE}_${label}.bed"
 done
 
-#Nucleosome or H2A enrichment on H2AK119ub1 peaks
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeEnriched_0.001.bed > NucleosomeEnriched_0.001.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeEnriched_0.05.bed > NucleosomeEnriched_0.05.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeEnriched_0.1.bed > NucleosomeEnriched_0.1.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeDepleted_0.001.bed > NucleosomeDepleted_0.001.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeDepleted_0.05.bed > NucleosomeDepleted_0.05.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b NucleosomeDepleted_0.1.bed > NucleosomeDepleted_0.1.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b H2Aenriched_0.001.bed > H2Aenriched_0.001.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b H2Aenriched_0.05.bed > H2Aenriched_0.05.coverage
-bedtools coverage -a Merged_Untreated_Sp_H2Aub_ChIP_001.XL92_peaks.bed -b H2Aenriched_0.1.bed > H2Aenriched_0.1.coverage
-
-#sperm H2AK119ub1 signal on Nucleosome or H2A enrichment 
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeEnriched_0.001.bed > FragmentSize/Input_NucleosomeEnriched_0.001.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeEnriched_0.05.bed > FragmentSize/Input_NucleosomeEnriched_0.05.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeEnriched_0.1.bed > FragmentSize/Input_NucleosomeEnriched_0.1.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeDepleted_0.001.bed > FragmentSize/Input_NucleosomeDepleted_0.001.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeDepleted_0.05.bed > FragmentSize/Input_NucleosomeDepleted_0.05.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeDepleted_0.1.bed > FragmentSize/Input_NucleosomeDepleted_0.1.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/H2Aenriched_0.001.bed > FragmentSize/Input_H2Aenriched_0.001.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/H2Aenriched_0.05.bed > FragmentSize/Input_H2Aenriched_0.05.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b IGV/H2Aenriched_0.1.bed > FragmentSize/Input_H2Aenriched_0.1.bam
-bedtools intersect -f 0.5 -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeEnriched_0.001.bed > FragmentSize/Input_NucleosomeEnriched_0.001_MidOverlap.bam
-bedtools intersect -f 0.5 -a Merged/Input_Sp_WithoutDupl.bam -b IGV/NucleosomeDepleted_0.001.bed > FragmentSize/Input_NucleosomeDepleted_0.001_MidOverlap.bam
-bedtools intersect -f 0.5 -a Merged/Input_Sp_WithoutDupl.bam -b IGV/H2Aenriched_0.001.bed > FragmentSize/Input_H2Aenriched_0.001_MidOverlap.bam
-
-#Check fragment size of isolated reads on fragment size (control test)
-for f in `ls -1 FragmentSize/*_MidOverlap.bam  | cut -d "/" -f 2 | sed 's/.bam//'`
-	do 
-	   bamCoverage -bs 50 -v -p 4 -b FragmentSize/${f}.bam -o IGV/${f}.bw
-	   samtools sort -@ 6 FragmentSize/${f}.bam -o FragmentSize/${f}.sort.bam
-	   samtools index FragmentSize/${f}.sort.bam
-	   bamPEFragmentSize -p 8 --plotFileFormat pdf -b FragmentSize/${f}.sort.bam -T "Fragment size of PE RNA-seq datas" --maxFragmentLength 300 -o FragmentSize/${f}_Hist.pdf --table FragmentSize/${f}.tsv --samplesLabel ${f}
+# Split H2A model into two BED files
+for flag_val in 1 2; do
+    label=$([ "${flag_val}" -eq 1 ] && echo "H2APos" || echo "H2ANeg")
+    grep $'\t'"${flag_val}"'$' "Merged/${SAMPLE}_H2A.bed" \
+        | sort -k1,1 -k2,2n \
+        > "Merged/${SAMPLE}_${label}.bed"
 done
 
-#extract Sperm reads fragment size reads on H2A enriched or subNucleosome genomic enriched regions
-sort -k1,1 -k2,2n Merged/Input_Sp_WithoutDupl_SubNucl.bed | mergeBed > Merged/Input_Sp_WithoutDupl_SubNucl.sorted.bed 
-sort -k1,1 -k2,2n Merged/Input_Sp_WithoutDupl_H2APos.bed | mergeBed > Merged/Input_Sp_WithoutDupl_H2APos.sorted.bed 
-sort -k1,1 -k2,2n Merged/Input_Sp_WithoutDupl_H2ANeg.bed | mergeBed > Merged/Input_Sp_WithoutDupl_H2ANeg.sorted.bed 
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.bam -b Merged/Input_Sp_WithoutDupl_Nucl.bed > IGV/Input_Nucleosome.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.sort.bam -b Merged/Input_Sp_WithoutDupl_SubNucl.sorted.bed > IGV/Input_SubNucleosome.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.sort.bam -b Merged/Input_Sp_WithoutDupl_H2APos.sorted.bed > IGV/Input_WithH2A.bam
-bedtools intersect -a Merged/Input_Sp_WithoutDupl.sort.bam -b Merged/Input_Sp_WithoutDupl_H2ANeg.sorted.bed > IGV/Input_WithoutH2A.bam
-samtools sort -@ 6 IGV/Input_Nucleosome.bam -o IGV/Input_Nucleosome.sort.bam
-samtools sort -@ 6 IGV/Input_SubNucleosome.bam -o IGV/Input_SubNucleosome.sort.bam
-samtools sort -@ 6 IGV/Input_WithH2A.bam -o IGV/Input_WithH2A.sort.bam
-samtools sort -@ 6 IGV/Input_WithoutH2A.bam -o IGV/Input_WithoutH2A.sort.bam
 
-#Compute H2A and Nucleosome enrichment IGV track 
-samtools index IGV/Input_Nucleosome.sort.bam
-samtools index IGV/Input_SubNucleosome.sort.bam
-bamCompare --binSize 50 -p 4 -v -of bigwig -b1 IGV/Input_Nucleosome.sort.bam -b2 IGV/Input_SubNucleosome.sort.bam -o IGV/NuclPos_vs_SubNuclNeg_log2ratio.bw
+# =============================================================================
+# III. PER-BIN COVERAGE (bedtools intersect — 250 bp / slide 50 bp)
+# =============================================================================
 
-samtools index IGV/Input_WithH2A.sort.bam
-samtools index IGV/Input_WithoutH2A.sort.bam
-bamCompare --binSize 50 -p 4 -v -of bigwig -b1 IGV/Input_WithH2A.sort.bam -b2 IGV/Input_WithoutH2A.sort.bam -o IGV/H2APos_vs_H2ANeg_log2ratio.bw
+echo "[2/11] Computing read coverage per genomic bin..."
 
-
-###########################################
-##### DNA Ladder ratio ChIP/Input #########
-###########################################
-
-#RATIO H2Aub => 10807/484 = 22.33 (from 601_DNA reads data extracted, ChIP/Input 601_DNA reads)
-
-#extract ChIP and Input sperm reads on Xenopus laevis bins
-awk '{print $1"\t"($2+100)"\t"($3-100)}' DNALadder/XLaevis_250bpbin_slid50.bed > DNALadder/XLaevis_50bpbin.bed
-
-#For each sample file, compute Ladder normalized signal from ChIP. Be careful to edit RATIO H2Aub correction, at 48400/10807 in that case
-for f in `ls -1 DNALadder/*_INPUT_Input.XL92.sort.filter.bam | cut -d "/" -f 2 | sed 's/_INPUT_Input.XL92.sort.filter.bam//'`
-	do
-	bedtools intersect -a DNALadder/XLaevis_250bpbin.bed -b DNALadder/${f}_INPUT_Input.XL92.sort.filter.bam -c > DNALadder/${f}_INPUT_Input.GenomeCov.bed
-	bedtools intersect -a DNALadder/XLaevis_250bpbin.bed -b DNALadder/${f}_H2Aub_ChIP.XL92.sort.filter.bam -c > DNALadder/${f}_H2Aub_ChIP.GenomeCov.bed
-	paste DNALadder/${f}_H2Aub_ChIP.GenomeCov.bed DNALadder/${f}_INPUT_Input.GenomeCov.bed | awk '{if($8>0){print $1"\t"$2"\t"$3"\t"$4"\t"($8)*(2)"\t"($4/(($8)*(2)))"\t"($4/(($8)*(2)))*(48400/10807);}if($8=0){print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t""0"}}' > DNALadder/${f}_LadderCov.bed
-	awk '{print $1"\t"$2"\t"$3"\t"$7}' DNALadder/${f}_LadderCov.bed > DNALadder/${f}_LadderCov.bg
-	./bedGraphtoBigWig DNALadder/${f}_LadderCov.bg chromSizesXL9.bed DNALadder/${f}_LadderCov.bw
+for fraction in Nucl SubNucl H2APos H2ANeg; do
+    bedtools intersect \
+        -sorted \
+        -a "${GENOME_BIN}" \
+        -b "Merged/${SAMPLE}_${fraction}.bed" \
+        -c \
+        > "Fragment/${SAMPLE}_${fraction}_slid50.bed"
 done
 
-#Ladder
-computeMatrix reference-point -p 4 --referencePoint center --verbose -S cutadapt_oo-WT_LadderCov.bw cutadapt_Unt_LadderCov.bw cutadapt_oo-U21_LadderCov.bw cutadapt_Untreated_Sp_LadderCov.bw cutadapt_Egg-oo-WT_LadderCov.bw cutadapt_Egg-Unt_LadderCov.bw cutadapt_Egg-oo-U21_LadderCov.bw cutadapt_EggExtract_Sp_LadderCov.bw -R USP21sensitivesTSS.bed MZTSS.bed MaternalOnlyTSS.bed ZygoticTSS.bed OthersTSS.bed GenesTSS.bed --binSize 50 --missingDataAsZero --beforeRegionStartLength 5000 --afterRegionStartLength 5000 --skipZeros -out Droso_USP21Sensitive_LadderH2Aub.mat.gz --outFileNameMatrix Droso_USP21Sensitive_LadderH2Aub.tab --outFileSortedRegions Droso_USP21Sensitive_LadderH2Aub.region.bed
-plotProfile --samplesLabel oo-WTH2Aub oo-UntH2Aub oo-USP21H2Aub oldoo-UntH2Aub egg-WTH2Aub egg-UntH2Aub egg-USP21H2Aub oldegg-UntH2Aub --regionsLabel USP21_DEGenes MZGenes MaternalNonZygoticGenes ZygoticGenes OthersGenes AllGenes -m Droso_USP21Sensitive_LadderH2Aub.mat.gz -out Droso_USP21Sensitive_LadderH2Aub.profile.svg --outFileNameData Droso_USP21Sensitive_LadderH2Aub.tsv
+# Combine Nucl + SubNucl into 6-column bedgraph (col4=Nucl, col5=SubNucl, col6=Total)
+paste "Fragment/${SAMPLE}_Nucl_slid50.bed" \
+      "Fragment/${SAMPLE}_SubNucl_slid50.bed" \
+    | awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t"($4+$8)}' \
+    > "Fragment/${SAMPLE}.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_Nucl_vs_SemiNucl.full.bedgraph"
 
-#H2AK119ub1 calibration
-paste DNALadder/cutadapt_Untreated_Sp_H2Aub_ChIP.250bp.bed DNALadder/cutadapt_Untreated_Sp_INPUT_Input.250bp.bed | awk '{if($8>0){print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t"($4/($8))"\t"($4/($8))*(48400/10807);}if($8=0){print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t""0"}}' > DNALadder.bed
-awk '{print $1"\t"$2"\t"$3"\t"$7}' DNALadder.bed  > DNALadder.bg
-awk '{if($4>100){print $1"\t"$2"\t"$3"\t""100"}if($4<=100){print $1"\t"$2"\t"$3"\t"$4}}' DNALadder.bg  > DNALadder_MAX.bg
-./bedGraphtoBigWig DNALadder_MAX.bg chromSizesXL9.bed DNALadder.bw
+# Combine H2APos + H2ANeg
+paste "Fragment/${SAMPLE}_H2APos_slid50.bed" \
+      "Fragment/${SAMPLE}_H2ANeg_slid50.bed" \
+    | awk '{print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t"($4+$8)}' \
+    > "Fragment/${SAMPLE}.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_H2A_vs_NonH2A.full.bedgraph"
+
+# Filter bins with >= MIN_FRAG_READS total reads
+for bg in \
+    "Fragment/${SAMPLE}.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_Nucl_vs_SemiNucl.full.bedgraph" \
+    "Fragment/${SAMPLE}.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_H2A_vs_NonH2A.full.bedgraph"; do
+    awk -v min="${MIN_FRAG_READS}" '$6 >= min' "${bg}" \
+        > "${bg%.full.bedgraph}_above5.full.bedgraph"
+done
+
+
+# =============================================================================
+# NOTE: PROPORTION TESTS — run separately via R
+# =============================================================================
+# The .probabilities output files required by Section IV below are generated
+# by running:
+#   Rscript ProcessingChIPdata.R
+# (Section VI of that script — standalone, not called from here)
+
+
+# =============================================================================
+# IV. P-VALUE DISCRETISATION AND BED MERGING
+# =============================================================================
+
+echo "[3/11] Discretising p-values and merging BED intervals..."
+
+H2A_PROB="Fragment/${SAMPLE}.Fragm150-110_vs70_sum_nodup_250bpbin_slid50_above5_H2A_vs_NoH2A.probabilities"
+NUCL_PROB="Fragment/${SAMPLE}.Fragm150_vs110-70_sum_nodup_250bpbin_slid50_above5_Nucl_vs_SemiNucl.probabilities"
+
+# Discretise H2A model: 3 levels (p<=0.1=1, p<=0.05=2, p<=0.001=3)
+awk '{
+    p1=0; p2=0
+    if ($6 > 0) {
+        if ($9  <= 0.1)   p1=1
+        if ($9  <= 0.05)  p1=2
+        if ($9  <= 0.001) p1=3
+        if ($10 <= 0.1)   p2=1
+        if ($10 <= 0.05)  p2=2
+        if ($10 <= 0.001) p2=3
+    }
+    print $0"\t"p1"\t"p2
+}' "${H2A_PROB}" > "${H2A_PROB}.discrete"
+
+# Discretise Nucl model: 5 levels (adds p<=0.0001 and p<=0.00001)
+awk '{
+    p1=0; p2=0
+    if ($6 > 0) {
+        if ($9  <= 0.1)      p1=1
+        if ($9  <= 0.05)     p1=2
+        if ($9  <= 0.001)    p1=3
+        if ($9  <= 0.0001)   p1=4
+        if ($9  <= 0.00001)  p1=5
+        if ($10 <= 0.1)      p2=1
+        if ($10 <= 0.05)     p2=2
+        if ($10 <= 0.001)    p2=3
+        if ($10 <= 0.0001)   p2=4
+        if ($10 <= 0.00001)  p2=5
+    }
+    print $0"\t"p1"\t"p2
+}' "${NUCL_PROB}" > "${NUCL_PROB}.discrete"
+
+# =============================================================================
+# NOTE: PROPORTION TESTS — run separately via R
+# =============================================================================
+# The .probabilities output files required by Section IV below are generated
+# by running:
+#   Rscript ProcessingChIPdata.R
+# (Section VI of that script — standalone, not called from here)
+
+
+# =============================================================================
+# IV. P-VALUE DISCRETISATION AND BED MERGING
+# =============================================================================
+
+# Merge BED at each FDR threshold
+for label in "${PVAL_LABELS[@]}"; do
+    lvl=$(echo "${label}" | awk '{if($1==0.1) print 1; else if($1==0.05) print 2; else print 3}')
+    awk -v t="${lvl}" '$11 >= t' "${H2A_PROB}.discrete"  | mergeBed > "IGV/H2Aenriched_${label}.bed"
+    awk -v t="${lvl}" '$12 >= t' "${H2A_PROB}.discrete"  | mergeBed > "IGV/H2Adepleted_${label}.bed"
+    awk -v t="${lvl}" '$11 >= t' "${NUCL_PROB}.discrete" | mergeBed > "IGV/NucleosomeEnriched_${label}.bed"
+    awk -v t="${lvl}" '$12 >= t' "${NUCL_PROB}.discrete" | mergeBed > "IGV/NucleosomeDepleted_${label}.bed"
+done
+
+
+# =============================================================================
+# V. PER-CHROMOSOME COVERAGE OF ENRICHED/DEPLETED REGIONS
+# =============================================================================
+
+echo "[4/11] Computing per-chromosome coverage..."
+
+for bed in IGV/*.bed; do
+    name=$(basename "${bed}" .bed)
+    bedtools coverage \
+        -a "${CHROM_BED}" \
+        -b "${bed}" \
+        > "Coverage/Coverage_${name}.bed"
+done
+
+
+# =============================================================================
+# VI. INTERSECTION WITH H2AK119ub1 PEAKS
+# =============================================================================
+
+echo "[5/11] Intersecting with H2AK119ub1 peaks..."
+
+for label in "${PVAL_LABELS[@]}"; do
+    for type in NucleosomeEnriched NucleosomeDepleted H2Aenriched H2Adepleted; do
+        bedtools coverage \
+            -a "${PEAKS}" \
+            -b "IGV/${type}_${label}.bed" \
+            > "Coverage/${type}_${label}.coverage"
+    done
+done
+
+
+# =============================================================================
+# VII. FRAGMENT SUBSET EXTRACTION — BAM per fraction
+# =============================================================================
+
+echo "[6/11] Extracting BAM per fragment fraction..."
+
+for type in Nucl SubNucl; do
+    sort -k1,1 -k2,2n "Merged/${SAMPLE}_${type}.bed" \
+        | mergeBed \
+        > "Merged/${SAMPLE}_${type}.sorted.bed"
+done
+for type in H2APos H2ANeg; do
+    sort -k1,1 -k2,2n "Merged/${SAMPLE}_${type}.bed" \
+        | mergeBed \
+        > "Merged/${SAMPLE}_${type}.sorted.bed"
+done
+
+declare -A FRACTION_BED=(
+    [Nucleosome]="Merged/${SAMPLE}_Nucl.bed"
+    [SubNucleosome]="Merged/${SAMPLE}_SubNucl.sorted.bed"
+    [WithH2A]="Merged/${SAMPLE}_H2APos.sorted.bed"
+    [WithoutH2A]="Merged/${SAMPLE}_H2ANeg.sorted.bed"
+)
+
+for label in "${!FRACTION_BED[@]}"; do
+    bedtools intersect \
+        -a "Merged/${SAMPLE}.sort.bam" \
+        -b "${FRACTION_BED[$label]}" \
+        > "IGV/Input_${label}.bam"
+    samtools sort -@ 6 "IGV/Input_${label}.bam" \
+        -o "IGV/Input_${label}.sort.bam"
+    samtools index "IGV/Input_${label}.sort.bam"
+done
+
+
+# =============================================================================
+# VIII. FRAGMENT SIZE QC PER FRACTION
+# =============================================================================
+
+echo "[7/11] Fragment size QC per fraction..."
+
+for bam in IGV/Input_*.sort.bam; do
+    sample=$(basename "${bam}" .sort.bam)
+    bamPEFragmentSize \
+        --maxFragmentLength 300 --binSize 1000 \
+        -p "${THREADS}" \
+        -b "${bam}" \
+        -T "Fragment size — ${sample}" \
+        --plotFileFormat pdf \
+        -o "FragmentSize/${sample}_FragmentSize.pdf" \
+        --table "FragmentSize/${sample}.tsv" \
+        --samplesLabel "${sample}"
+done
+
+# MidOverlap fraction (if pre-generated)
+for bam in FragmentSize/*_MidOverlap.bam; do
+    [ -f "${bam}" ] || continue
+    sample=$(basename "${bam}" .bam)
+    samtools sort  -@ 6 "${bam}" -o "FragmentSize/${sample}.sort.bam"
+    samtools index "FragmentSize/${sample}.sort.bam"
+    bamPEFragmentSize \
+        -p "${THREADS}" --plotFileFormat pdf \
+        --maxFragmentLength 300 \
+        -b "FragmentSize/${sample}.sort.bam" \
+        -T "Fragment size" \
+        -o "FragmentSize/${sample}_Hist.pdf" \
+        --table "FragmentSize/${sample}.tsv" \
+        --samplesLabel "${sample}"
+done
+
+
+# =============================================================================
+# IX. LOG2 RATIO BIGWIG TRACKS (bamCompare)
+# =============================================================================
+
+echo "[8/11] log2(Nucleosome/SubNucleosome) and log2(H2APos/H2ANeg) BigWig..."
+
+bamCompare --binSize 50 -p "${THREADS}" -v -of bigwig --operation log2 \
+    -b1 IGV/Input_Nucleosome.sort.bam \
+    -b2 IGV/Input_SubNucleosome.sort.bam \
+    -o IGV/NuclPos_vs_SubNuclNeg_log2ratio.bw
+
+bamCompare --binSize 50 -p "${THREADS}" -v -of bigwig --operation log2 \
+    -b1 IGV/Input_WithH2A.sort.bam \
+    -b2 IGV/Input_WithoutH2A.sort.bam \
+    -o IGV/H2APos_vs_H2ANeg_log2ratio.bw
+
+
+# =============================================================================
+# X. 601 DNA LADDER SPIKE-IN NORMALISATION → BigWig
+# Normalisation ratio = INPUT_601_reads / CHIP_601_reads
+# =============================================================================
+
+echo "[9/11] 601 DNA ladder spike-in normalisation (ratio = ${LADDER_RATIO})..."
+
+# 50 bp bin version (trim 100 bp from each end of 250 bp bins)
+awk '{print $1"\t"($2+100)"\t"($3-100)}' \
+    "DNALadder/XLaevis_250bpbin_slid50.bed" \
+    > "DNALadder/XLaevis_50bpbin.bed"
+
+for input_bam in DNALadder/*_INPUT_Input.XL92.sort.filter.bam; do
+    sample=$(basename "${input_bam}" _INPUT_Input.XL92.sort.filter.bam)
+
+    bedtools intersect \
+        -a "DNALadder/XLaevis_250bpbin.bed" \
+        -b "DNALadder/${sample}_INPUT_Input.XL92.sort.filter.bam" -c \
+        > "DNALadder/${sample}_INPUT_Input.GenomeCov.bed"
+
+    bedtools intersect \
+        -a "DNALadder/XLaevis_250bpbin.bed" \
+        -b "DNALadder/${sample}_H2Aub_ChIP.XL92.sort.filter.bam" -c \
+        > "DNALadder/${sample}_H2Aub_ChIP.GenomeCov.bed"
+
+    # Ladder normalisation: (ChIP_reads / (Input_reads * 2)) / ratio
+    paste "DNALadder/${sample}_H2Aub_ChIP.GenomeCov.bed" \
+          "DNALadder/${sample}_INPUT_Input.GenomeCov.bed" \
+        | awk -v ratio="${LADDER_RATIO}" '{
+            if ($8 > 0)
+                print $1"\t"$2"\t"$3"\t"$4"\t"($8*2)"\t"($4/(($8)*2))"\t"($4/(($8)*2))/ratio
+            else
+                print $1"\t"$2"\t"$3"\t"$4"\t"$8"\t0\t0"
+        }' > "DNALadder/${sample}_LadderCov.bed"
+
+    awk '{print $1"\t"$2"\t"$3"\t"$7}' "DNALadder/${sample}_LadderCov.bed" \
+        > "DNALadder/${sample}_LadderCov.bg"
+
+    ./bedGraphtoBigWig \
+        "DNALadder/${sample}_LadderCov.bg" \
+        "${CHROM_SIZES}" \
+        "DNALadder/${sample}_LadderCov.bw"
+    echo "  BigWig saved: ${sample}_LadderCov.bw"
+done
+
+
+# =============================================================================
+# XI. DEEPTOOLS — computeMatrix + plotProfile (ladder-normalised profiles)
+# =============================================================================
+
+echo "[10/11] deepTools computeMatrix + plotProfile (ladder profiles)..."
+
+computeMatrix reference-point \
+    -p "${THREADS}" \
+    --referencePoint center --verbose \
+    -S  cutadapt_oo-WT_LadderCov.bw \
+        cutadapt_Unt_LadderCov.bw \
+        cutadapt_oo-U21_LadderCov.bw \
+        cutadapt_Untreated_Sp_LadderCov.bw \
+        cutadapt_Egg-oo-WT_LadderCov.bw \
+        cutadapt_Egg-Unt_LadderCov.bw \
+        cutadapt_Egg-oo-U21_LadderCov.bw \
+        cutadapt_EggExtract_Sp_LadderCov.bw \
+    -R  USP21sensitivesTSS.bed \
+        MaternalOnlyTSS.bed \
+        ZygoticTSS.bed \
+        MZTSS.bed \
+        OthersTSS.bed \
+        GenesTSS.bed \
+    --binSize 50 --missingDataAsZero \
+    --beforeRegionStartLength 5000 \
+    --afterRegionStartLength  5000 \
+    --skipZeros \
+    -out Droso_USP21Sensitive_LadderH2Aub.mat.gz \
+    --outFileNameMatrix    Droso_USP21Sensitive_LadderH2Aub.tab \
+    --outFileSortedRegions Droso_USP21Sensitive_LadderH2Aub.region.bed
+
+plotProfile \
+    --samplesLabel \
+        oo-WTH2Aub oo-UntH2Aub oo-USP21H2Aub oldo-UntH2Aub \
+        egg-WTH2Aub egg-UntH2Aub egg-USP21H2Aub oldegg-UntH2Aub \
+    --regionsLabel \
+        USP21_DEGenes MaternalNonZygotic Zygotic MZ Others AllGenes \
+    -m Droso_USP21Sensitive_LadderH2Aub.mat.gz \
+    -out Droso_USP21Sensitive_LadderH2Aub.profile.svg \
+    --outFileNameData Droso_USP21Sensitive_LadderH2Aub.tsv
+
+echo "[11/11] H2A enrichment pipeline complete."
