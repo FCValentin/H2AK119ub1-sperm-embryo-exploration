@@ -200,13 +200,11 @@ awk '{
 }' "${NUCL_PROB}" > "${NUCL_PROB}.discrete"
 
 # =============================================================================
-# NOTE: PROPORTION TESTS — run separately via R
+# NOTE: HIDDEN MARKOV MODEL — run separately via R
 # =============================================================================
-# The .probabilities output files required by Section IV below are generated
+# The _hmm_state_50bpw.full output files not required by Section IV below are generated
 # by running:
-#   Rscript ProcessingChIPdata.R
-# (Section VI of that script — standalone, not called from here)
-
+#   Rscript ProcessingChIPdata.
 
 # =============================================================================
 # IV. P-VALUE DISCRETISATION AND BED MERGING
